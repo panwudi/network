@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  hk-setup.sh  —  香港中转节点一键运维脚本
-#  版本：v1.0
+#  版本：v1.1
 #  用法：sudo bash hk-setup.sh
 #  模式：1) 全新安装  2) 备份  3) 恢复
+#
+#  设计原则：
+#    - 所有步骤幂等，可安全重复执行
+#    - 采集网络信息前，确保 wg0 已停止（防止 wg0 运行时污染探测结果）
+#    - 任何破坏性操作前先解除保护（chattr -i 等）
+#    - 失败时给出具体排查命令，不静默吞错
 # =============================================================================
 
 set -euo pipefail
@@ -26,6 +32,7 @@ readonly V2BX_CONF="/etc/V2bX/config.yml"
 readonly SING_CONF="/etc/V2bX/sing_origin.json"
 readonly PANEL_IP_FILE="/etc/hk-setup/panel_ip"
 readonly UPDATE_PANEL_SCRIPT="/usr/local/bin/update-panel-route.sh"
+readonly LO_FIX_SERVICE="/etc/systemd/system/lo-127-fix.service"
 
 # ── 全局变量（各函数间共享）──────────────────────────────────────────────────
 HK_PUB_IP=""
@@ -47,9 +54,11 @@ PANEL_IP=""
 info()    { echo -e "${GREEN}[INFO]${NC}  $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-header()  { echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; \
-            echo -e "${BOLD}${BLUE}  $*${NC}"; \
-            echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"; }
+header()  {
+  echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${BOLD}${BLUE}  $*${NC}"
+  echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+}
 success() { echo -e "  ${GREEN}✓${NC}  $*"; }
 fail_msg(){ echo -e "  ${RED}✗${NC}  $*"; }
 
@@ -66,14 +75,11 @@ confirm() {
   done
 }
 
-# 读取用户输入，支持默认值
-# 用法：read_input "提示文字" 变量名 [默认值]
 read_input() {
   local label="$1"
   local var_name="$2"
   local default="${3:-}"
   local value=""
-
   while true; do
     if [[ -n "$default" ]]; then
       read -rp "$(echo -e "  ${CYAN}›${NC} ${label} [${YELLOW}${default}${NC}]: ")" value
@@ -81,9 +87,7 @@ read_input() {
     else
       read -rp "$(echo -e "  ${CYAN}›${NC} ${label}: ")" value
     fi
-    if [[ -n "$value" ]]; then
-      break
-    fi
+    [[ -n "$value" ]] && break
     warn "不能为空，请重新输入"
   done
   printf -v "$var_name" '%s' "$value"
@@ -104,6 +108,32 @@ check_debian() {
   fi
 }
 
+# 统一的 wg0 停止入口（systemctl + wg-quick 双保险，自动恢复默认路由）
+stop_wg0() {
+  if ! ip link show wg0 &>/dev/null 2>&1; then
+    return 1  # wg0 本来就没在跑
+  fi
+
+  systemctl stop wg-quick@wg0 2>/dev/null || true
+  wg-quick down wg0            2>/dev/null || true
+  sleep 1
+
+  # PostDown 有时不恢复默认路由，从 eth0rt 表捞出记录值补回
+  if ! ip route show default 2>/dev/null | grep -q 'default'; then
+    local saved_gw saved_if
+    saved_if=$(ip route show table eth0rt 2>/dev/null | awk '/default/{print $5}' | head -1 || echo "")
+    saved_gw=$(ip route show table eth0rt 2>/dev/null | awk '/default/{print $3}' | head -1 || echo "")
+    if [[ -n "$saved_if" && -n "$saved_gw" ]]; then
+      ip route replace default via "$saved_gw" dev "$saved_if" onlink 2>/dev/null || true
+      warn "已从 eth0rt 表恢复默认路由：via ${saved_gw} dev ${saved_if}"
+    else
+      warn "无法自动恢复默认路由，请手动执行："
+      warn "  ip route replace default via <网关> dev <网卡>"
+    fi
+  fi
+  return 0  # wg0 之前在跑，现已停止
+}
+
 # =============================================================================
 #  主菜单
 # =============================================================================
@@ -112,7 +142,7 @@ show_menu() {
   clear
   echo -e "${BOLD}${BLUE}"
   echo "  ╔══════════════════════════════════════════════════════╗"
-  echo "  ║        香港中转节点  运维脚本  v1.0                  ║"
+  echo "  ║        香港中转节点  运维脚本  v1.1                  ║"
   echo "  ║        HK Transit Node  Setup Script                ║"
   echo "  ╚══════════════════════════════════════════════════════╝"
   echo -e "${NC}"
@@ -133,47 +163,52 @@ show_menu() {
 mode_backup() {
   header "备份模式：提取当前 WireGuard 配置"
 
-  # 检查前提条件
   if ! command -v wg &>/dev/null; then
-    error "未检测到 wireguard-tools"
-    error "当前系统可能尚未安装 WireGuard，无需备份，直接运行「全新安装」"
+    error "未检测到 wireguard-tools，无需备份，直接运行「全新安装」"
     exit 1
   fi
 
   if [[ ! -f "$WG_CONF" ]]; then
-    error "未找到 ${WG_CONF}"
-    error "WireGuard 配置文件不存在，无需备份，直接运行「全新安装」"
+    error "未找到 ${WG_CONF}，无需备份，直接运行「全新安装」"
     exit 1
   fi
 
   info "正在从 ${WG_CONF} 提取配置..."
 
-  # 从 wg0.conf 提取字段（容错：字段不存在时返回空）
   local priv_key addr peer_pubkey endpoint allowed_ips keepalive
-  priv_key=$(  grep -E '^\s*PrivateKey'          "$WG_CONF" | awk '{print $NF}' || echo "")
-  addr=$(      grep -E '^\s*Address'              "$WG_CONF" | awk '{print $NF}' || echo "")
+  priv_key=$(   grep -E '^\s*PrivateKey'         "$WG_CONF" | awk '{print $NF}' || echo "")
+  addr=$(       grep -E '^\s*Address'             "$WG_CONF" | awk '{print $NF}' || echo "")
   peer_pubkey=$(grep -E '^\s*PublicKey'           "$WG_CONF" | awk '{print $NF}' || echo "")
-  endpoint=$(  grep -E '^\s*Endpoint'             "$WG_CONF" | awk '{print $NF}' || echo "")
+  endpoint=$(   grep -E '^\s*Endpoint'            "$WG_CONF" | awk '{print $NF}' || echo "")
   allowed_ips=$(grep -E '^\s*AllowedIPs'          "$WG_CONF" | awk '{print $NF}' || echo "")
-  keepalive=$( grep -E '^\s*PersistentKeepalive'  "$WG_CONF" | awk '{print $NF}' || echo "25")
+  keepalive=$(  grep -E '^\s*PersistentKeepalive' "$WG_CONF" | awk '{print $NF}' || echo "25")
 
-  # 推导本机公钥（需要私钥非空）
-  local pub_key="（无法推导，请手动记录）"
-  if [[ -n "$priv_key" ]]; then
+  local pub_key="（无法推导）"
+  [[ -n "$priv_key" ]] && \
     pub_key=$(echo "$priv_key" | wg pubkey 2>/dev/null || echo "（推导失败）")
+
+  # 网络信息：wg0 运行时会被污染，先停掉
+  if ip link show wg0 &>/dev/null 2>&1; then
+    warn "wg0 正在运行，临时关闭以获取本机真实网络信息..."
+    stop_wg0
   fi
 
-  # 自动检测网络信息
   local wan_if hk_gw hk_pub_ip
-  wan_if=$(    ip route show default | awk '/default/ {print $5}' | head -1 || echo "（未检测到）")
-  hk_gw=$(     ip route show default | awk '/default/ {print $3}' | head -1 || echo "（未检测到）")
-  hk_pub_ip=$( curl -4 -s --max-time 8 https://ifconfig.io 2>/dev/null        || echo "（获取失败，请手动填写）")
+  wan_if=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1 || echo "（未检测到）")
+  hk_gw=$( ip route show default 2>/dev/null | awk '/default/{print $3}' | head -1 || echo "（未检测到）")
 
-  # ── 输出备份信息 ──────────────────────────────────────────────────────────
+  if [[ -n "$wan_if" && "$wan_if" != "（未检测到）" ]]; then
+    hk_pub_ip=$(curl --interface "$wan_if" -4 -s --max-time 10 \
+                  https://ifconfig.io 2>/dev/null || echo "（获取失败，请手动填写）")
+  else
+    hk_pub_ip=$(curl -4 -s --max-time 10 https://ifconfig.io 2>/dev/null \
+                  || echo "（获取失败，请手动填写）")
+  fi
+
   echo ""
   echo -e "${BOLD}${YELLOW}  ┌─────────────────────────────────────────────────────────────────┐${NC}"
-  echo -e "${BOLD}${YELLOW}  │            请完整复制以下内容，保存到安全位置                  │${NC}"
-  echo -e "${BOLD}${YELLOW}  │            重装系统后「恢复模式」需要用到这些值                │${NC}"
+  echo -e "${BOLD}${YELLOW}  │          请完整复制以下内容，保存到安全位置                    │${NC}"
+  echo -e "${BOLD}${YELLOW}  │          重装系统后「恢复模式」需要用到这些值                  │${NC}"
   echo -e "${BOLD}${YELLOW}  └─────────────────────────────────────────────────────────────────┘${NC}"
   echo ""
   echo "# ───────────────── WireGuard 备份信息 ─────────────────"
@@ -192,29 +227,29 @@ mode_backup() {
   echo "# ────────────────────────────────────────────────────────"
   echo ""
 
-  warn "私钥（HK_PRIV_KEY）极度敏感，请勿通过聊天/邮件/截图传输"
+  warn "私钥（HK_PRIV_KEY）极度敏感，请勿通过聊天 / 邮件 / 截图传输"
   warn "建议保存在本地加密文档中（如 KeePass、1Password 等）"
   echo ""
 
-  confirm "已确认复制并安全保存以上信息？" || { warn "请先保存备份信息再退出"; exit 0; }
+  confirm "已确认复制并安全保存以上信息？" || { warn "请先保存后再退出"; exit 0; }
 
   echo ""
   echo -e "${BOLD}下一步操作：${NC}"
   echo "  1. 重装服务器系统（推荐 Debian 12）"
-  echo "  2. 重装完成后，将此脚本上传到新系统"
-  echo "  3. 执行：sudo bash hk-setup.sh"
-  echo "  4. 选择「3) 恢复模式」，粘贴刚才保存的备份值"
+  echo "  2. 重装完成后上传此脚本"
+  echo "  3. 执行：sudo bash hk-setup.sh → 选择「3) 恢复模式」"
   echo ""
   info "备份完成，退出。"
 }
 
 # =============================================================================
-#  公共步骤：基础系统配置
+#  公共步骤 1/5：基础系统配置
 # =============================================================================
 
 step_base_system() {
   header "步骤 1/5：基础系统配置"
 
+  # 1.1 系统更新与依赖
   info "更新系统软件包..."
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get -y -qq full-upgrade
@@ -228,8 +263,53 @@ step_base_system() {
     tcpdump dnsutils ipset iptables-persistent
   success "依赖包安装完成"
 
+  # 1.2 loopback 127.0.0.1 检查与修复
+  # 部分云厂商镜像的 lo 接口不绑定 127.0.0.1，会导致本地服务互联、
+  # DNS 解析、sing-box 等出现莫名其妙的连通性问题。
+  info "检查 loopback 接口（lo）是否绑定 127.0.0.1..."
+
+  if ! ip addr show lo 2>/dev/null | grep -q '127\.0\.0\.1'; then
+    warn "lo 接口未绑定 127.0.0.1，正在修复..."
+
+    ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
+    ip link set lo up              2>/dev/null || true
+
+    if ip addr show lo 2>/dev/null | grep -q '127\.0\.0\.1'; then
+      success "127.0.0.1 已添加到 lo（当前 session）"
+    else
+      error "添加 127.0.0.1 到 lo 失败，请检查内核网络模块"
+      exit 1
+    fi
+
+    # 持久化：systemd oneshot service，在任何网络配置之前运行
+    info "部署持久化 systemd 服务（lo-127-fix.service）..."
+    cat > "$LO_FIX_SERVICE" << 'EOF'
+[Unit]
+Description=Ensure 127.0.0.1 is bound to loopback interface
+Before=network-pre.target network.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'ip link set lo up; \
+  ip addr show lo | grep -q "127.0.0.1" || ip addr add 127.0.0.1/8 dev lo'
+
+[Install]
+WantedBy=sysinit.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --quiet lo-127-fix.service
+    success "lo-127-fix.service 已部署并启用（重启后自动执行）"
+  else
+    success "lo 接口 127.0.0.1 正常"
+    # 若服务已存在（上次修复过），确保仍然启用
+    [[ -f "$LO_FIX_SERVICE" ]] && \
+      systemctl enable --quiet lo-127-fix.service 2>/dev/null || true
+  fi
+
+  # 1.3 禁用 IPv6
   info "禁用 IPv6（防 IPv6 泄露）..."
-  # 直接覆写，重复运行安全
   cat > /etc/sysctl.d/99-no-ipv6.conf << 'EOF'
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
@@ -238,6 +318,7 @@ EOF
   sysctl --system -q
   success "IPv6 已禁用"
 
+  # 1.4 开启 IPv4 转发
   info "开启 IPv4 转发..."
   cat > /etc/sysctl.d/99-forward.conf << 'EOF'
 net.ipv4.ip_forward = 1
@@ -245,21 +326,21 @@ EOF
   sysctl --system -q
   success "IPv4 转发已开启"
 
+  # 1.5 IPv4 优先（幂等）
   info "配置 IPv4 优先（/etc/gai.conf）..."
-  # 幂等：已存在则不重复写
   grep -q 'ffff:0:0/96' /etc/gai.conf 2>/dev/null || \
     echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf
   success "IPv4 优先已配置"
 
+  # 1.6 禁用 systemd-resolved，锁定 resolv.conf
   info "禁用 systemd-resolved，锁定 resolv.conf（防 DNS 泄露）..."
-  # 先停服务，再解锁文件 —— 顺序不能反
   if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
     systemctl stop systemd-resolved
     systemctl disable systemd-resolved --quiet 2>/dev/null || true
   fi
-  systemctl mask systemd-resolved --quiet 2>/dev/null || true  # 防止依赖关系把它拉起来
-
-  # 无论文件是普通文件、symlink、还是已被 chattr +i，都先解锁再删除
+  # mask 防止被依赖拉起
+  systemctl mask systemd-resolved --quiet 2>/dev/null || true
+  # 先解锁（处理上次 chattr +i），再删除，再写入
   chattr -i /etc/resolv.conf 2>/dev/null || true
   rm -f /etc/resolv.conf
   cat > /etc/resolv.conf << 'EOF'
@@ -270,9 +351,9 @@ EOF
   chattr +i /etc/resolv.conf
   success "resolv.conf 已锁定（chattr +i）"
 
+  # 1.7 nftables
   info "启用 nftables..."
   systemctl enable --quiet nftables 2>/dev/null || true
-  # 若已在运行则 restart，否则 start；两种情况都容错
   if systemctl is-active --quiet nftables; then
     systemctl restart nftables
   else
@@ -285,47 +366,26 @@ EOF
 }
 
 # =============================================================================
-#  公共步骤：收集网络信息
+#  公共步骤 2/5：收集网络信息
 # =============================================================================
 
 step_collect_network() {
   header "步骤 2/5：网络信息"
 
-  # ── 第一步：如果 wg0 还在跑，先把它停掉 ────────────────────────────────────
-  # wg0 运行时：默认路由指向 wg0，ip route / curl 全部走美国，采集到的都是错误值。
-  # 最干净的方案是先停掉 wg0，让网络回归正常，再做探测。
-  # 后续 step_setup_wireguard 会重新生成 conf 并重启，不会丢失配置。
+  # wg0 运行时：默认路由指向 wg0，ip route / curl 全部返回美国值。
+  # 先停掉，让探测回归本机真实网络。
   if ip link show wg0 &>/dev/null 2>&1; then
-    warn "检测到 wg0 接口正在运行（上次安装残留），先将其关闭以确保采集到本机真实网络信息..."
-    systemctl stop wg-quick@wg0 2>/dev/null || true
-    wg-quick down wg0            2>/dev/null || true
-    sleep 1
-
-    # 如果停掉后默认路由消失（PostDown 有时不恢复），手动补回
-    if ! ip route show default | grep -q 'default'; then
-      # 从 eth0rt 表捞出之前记录的网关和网卡
-      local saved_gw saved_if
-      saved_if=$(ip route show table eth0rt 2>/dev/null | awk '/default/{print $5}' | head -1)
-      saved_gw=$(ip route show table eth0rt 2>/dev/null | awk '/default/{print $3}' | head -1)
-      if [[ -n "$saved_if" && -n "$saved_gw" ]]; then
-        ip route replace default via "$saved_gw" dev "$saved_if" onlink 2>/dev/null || true
-        warn "已从 eth0rt 表恢复默认路由：via ${saved_gw} dev ${saved_if}"
-      else
-        warn "无法自动恢复默认路由，请检查网络后手动执行："
-        warn "  ip route replace default via <网关> dev <网卡>"
-      fi
-    fi
-    success "wg0 已关闭，网络已回归本机直连"
+    warn "检测到 wg0 接口仍在运行（上次安装残留）"
+    warn "先关闭 wg0，确保采集到本机真实网络信息..."
+    stop_wg0
+    success "wg0 已关闭，继续采集"
   fi
 
-  # ── 第二步：此时 wg0 已确认关闭，做正常探测 ────────────────────────────────
   local auto_wan_if auto_hk_gw auto_hk_pub_ip
 
-  # 默认路由读取（此时一定走真实 WAN 网卡）
-  auto_wan_if=$(ip route show default | awk '/default/{print $5}' | head -1 || echo "")
-  auto_hk_gw=$( ip route show default | awk '/default/{print $3}' | head -1 || echo "")
+  auto_wan_if=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1 || echo "")
+  auto_hk_gw=$( ip route show default 2>/dev/null | awk '/default/{print $3}' | head -1 || echo "")
 
-  # 公网 IP：如果能确定网卡，用 --interface 绑定出站，双重保险
   if [[ -n "$auto_wan_if" ]]; then
     auto_hk_pub_ip=$(curl --interface "$auto_wan_if" -4 -s --max-time 10 \
                        https://ifconfig.io 2>/dev/null || echo "")
@@ -333,19 +393,15 @@ step_collect_network() {
     auto_hk_pub_ip=$(curl -4 -s --max-time 10 https://ifconfig.io 2>/dev/null || echo "")
   fi
 
-  # ── 第三步：结果展示与确认 ───────────────────────────────────────────────────
   info "自动检测结果："
   echo "    公网网卡 : ${auto_wan_if:-未检测到}"
   echo "    默认网关 : ${auto_hk_gw:-未检测到}"
   echo "    公网 IP  : ${auto_hk_pub_ip:-未检测到}"
   echo ""
 
-  # 如果任一字段为空，说明网络环境异常，给出明确提示
   if [[ -z "$auto_wan_if" || -z "$auto_hk_gw" || -z "$auto_hk_pub_ip" ]]; then
-    warn "部分字段未能自动检测，可能原因："
-    warn "  - 服务器没有默认路由（极少见）"
-    warn "  - 网络服务未就绪"
-    warn "请手动输入正确值，可参考：ip addr  /  ip route  /  云控制台"
+    warn "部分字段未能自动检测，请手动输入"
+    warn "可参考：ip addr  /  ip route  /  云控制台"
   fi
 
   echo ""
@@ -366,7 +422,7 @@ step_collect_network() {
 }
 
 # =============================================================================
-#  公共步骤：收集 WireGuard 配置（全新安装）
+#  公共步骤 3/5：收集 WireGuard 配置（全新安装）
 # =============================================================================
 
 step_collect_wg_fresh() {
@@ -375,7 +431,7 @@ step_collect_wg_fresh() {
   echo "  请准备以下信息（在美国节点执行 wg show 获取）："
   echo ""
 
-  read_input "香港节点 WG 私钥（PrivateKey，可在美国机新建 peer 时生成）" HK_WG_PRIV
+  read_input "香港节点 WG 私钥（PrivateKey）" HK_WG_PRIV
   read_input "香港节点 WG 隧道地址（如 10.0.0.3/32）" HK_WG_ADDR
   read_input "美国节点 WG 公钥（Peer PublicKey）" US_WG_PUBKEY
   read_input "美国节点 WG Endpoint（格式：IP:端口，如 5.6.7.8:51820）" US_WG_ENDPOINT
@@ -394,15 +450,15 @@ step_collect_wg_fresh() {
 }
 
 # =============================================================================
-#  公共步骤：收集 WireGuard 配置（恢复模式）
+#  公共步骤 3/5：收集 WireGuard 配置（恢复模式，整块粘贴）
 # =============================================================================
 
 step_collect_wg_restore() {
   header "步骤 3/5：WireGuard 配置（从备份恢复）"
 
-  echo -e "  ${BOLD}将备份内容整块粘贴到下方，粘贴完成后另起一行输入空行（直接回车）结束：${NC}"
+  echo -e "  ${BOLD}将备份内容整块粘贴到下方，粘贴完成后另起空行（直接回车）结束：${NC}"
   echo ""
-  echo "  示例格式（# 注释行会被忽略）："
+  echo "  示例格式（# 注释行自动忽略）："
   echo "    HK_PRIV_KEY=xxxxxxxx"
   echo "    HK_WG_ADDR=10.0.0.3/32"
   echo "    HK_WG_PEER_PUBKEY=xxxxxxxx"
@@ -411,39 +467,33 @@ step_collect_wg_restore() {
   echo ""
   echo "  ────── 开始粘贴 ──────────────────────────────────────────"
 
-  # 读取直到遇到空行
   local line key val
   while IFS= read -r line; do
-    # 空行 → 结束输入
-    [[ -z "$line" ]] && break
-    # 忽略注释行和非 KEY=VALUE 行
+    [[ -z "$line" ]]                && break
     [[ "$line" =~ ^[[:space:]]*# ]] && continue
-    [[ "$line" != *=* ]] && continue
+    [[ "$line" != *=* ]]            && continue
 
     key="${line%%=*}"
     val="${line#*=}"
-    # 去掉首尾空格
     key="${key// /}"
     val="${val#"${val%%[![:space:]]*}"}"
 
     case "$key" in
-      HK_PRIV_KEY)        HK_WG_PRIV="$val"      ;;
-      HK_WG_ADDR)         HK_WG_ADDR="$val"       ;;
-      HK_WG_PEER_PUBKEY)  US_WG_PUBKEY="$val"     ;;
-      HK_WG_ENDPOINT)     US_WG_ENDPOINT="$val"   ;;
-      HK_WG_ALLOWED_IPS)  : ;;  # 我们固定用 0.0.0.0/0，忽略
-      HK_WG_KEEPALIVE)    WG_KEEPALIVE="$val"     ;;
-      # 网络信息字段：备份时顺带记录，恢复时不强制用（step_collect_network 会自动检测）
-      HK_WAN_IF)          [[ -z "$HK_WAN_IF" ]]  && HK_WAN_IF="$val"  ;;
-      HK_GW)              [[ -z "$HK_GW" ]]      && HK_GW="$val"      ;;
-      HK_PUB_IP)          [[ -z "$HK_PUB_IP" ]]  && HK_PUB_IP="$val"  ;;
+      HK_PRIV_KEY)        HK_WG_PRIV="$val"    ;;
+      HK_WG_ADDR)         HK_WG_ADDR="$val"     ;;
+      HK_WG_PEER_PUBKEY)  US_WG_PUBKEY="$val"   ;;
+      HK_WG_ENDPOINT)     US_WG_ENDPOINT="$val" ;;
+      HK_WG_ALLOWED_IPS)  : ;;
+      HK_WG_KEEPALIVE)    WG_KEEPALIVE="$val"   ;;
+      HK_WAN_IF) [[ -z "$HK_WAN_IF" ]] && HK_WAN_IF="$val" ;;
+      HK_GW)     [[ -z "$HK_GW"     ]] && HK_GW="$val"     ;;
+      HK_PUB_IP) [[ -z "$HK_PUB_IP" ]] && HK_PUB_IP="$val" ;;
     esac
   done
 
   echo "  ────── 粘贴结束 ──────────────────────────────────────────"
   echo ""
 
-  # ── 检查必填字段 ─────────────────────────────────────────────────────────
   local missing=false
   [[ -z "$HK_WG_PRIV"     ]] && { warn "缺少 HK_PRIV_KEY";       missing=true; }
   [[ -z "$HK_WG_ADDR"     ]] && { warn "缺少 HK_WG_ADDR";        missing=true; }
@@ -451,17 +501,15 @@ step_collect_wg_restore() {
   [[ -z "$US_WG_ENDPOINT" ]] && { warn "缺少 HK_WG_ENDPOINT";    missing=true; }
 
   if [[ "$missing" == true ]]; then
-    warn "有必填字段未识别，请检查粘贴内容的格式（KEY=VALUE，每行一条）"
-    confirm "是否重新粘贴？" && step_collect_wg_restore || exit 1
+    warn "有必填字段未识别，请检查格式（KEY=VALUE，每行一条）"
+    confirm "是否重新粘贴？" && { step_collect_wg_restore; return; } || exit 1
   fi
 
-  # 美国 WG 隧道 IP：没有在备份里记录，手动补问
   if [[ -z "$US_WG_ADDR" ]]; then
     read_input "美国节点 WG 隧道内 IP（如 10.0.0.1/32）" US_WG_ADDR "10.0.0.1/32"
   fi
   [[ -z "$WG_KEEPALIVE" ]] && WG_KEEPALIVE="25"
 
-  # ── 确认解析结果 ─────────────────────────────────────────────────────────
   info "已解析的值："
   echo "    HK_WG_ADDR     = ${HK_WG_ADDR}"
   echo "    US_WG_PUBKEY   = ${US_WG_PUBKEY}"
@@ -469,33 +517,30 @@ step_collect_wg_restore() {
   echo "    US_WG_ADDR     = ${US_WG_ADDR}"
   echo "    KEEPALIVE      = ${WG_KEEPALIVE}s"
   echo ""
-  confirm "以上信息是否正确？" || step_collect_wg_restore
+  confirm "以上信息是否正确？" || { step_collect_wg_restore; return; }
 }
 
 # =============================================================================
-#  公共步骤：生成 wg0.conf 并启动 WireGuard
+#  公共步骤 4a/5：生成 wg0.conf 并启动 WireGuard
 # =============================================================================
 
 step_setup_wireguard() {
   header "步骤 4a/5：生成 WireGuard 配置"
 
-  # ── 防御：确保 wg0 已关闭，panel 域名解析和后续路由探测都走 eth0 ────────────
+  # 防御：wg0 必须已关闭，否则 panel 域名解析和路由探测都不准
   if ip link show wg0 &>/dev/null 2>&1; then
-    warn "wg0 仍在运行，关闭后再继续..."
-    systemctl stop wg-quick@wg0 2>/dev/null || true
-    wg-quick down wg0            2>/dev/null || true
-    sleep 1
+    warn "wg0 仍在运行，先关闭..."
+    stop_wg0
   fi
 
-  # ── 解析面板 IP（wg0 已关闭，此查询走 HK_WAN_IF 直出）──────────────────────
+  # 解析面板 IP（绑定 HK_PUB_IP 出站，排除残留路由干扰）
   info "解析面板域名 ${PANEL_DOMAIN}..."
-  local panel_ip
-  # 绑定 HK_WAN_IF 出站做查询，彻底排除残留路由的干扰
+  local panel_ip=""
+
   panel_ip=$(dig +short "$PANEL_DOMAIN" @1.1.1.1 -b "${HK_PUB_IP}" 2>/dev/null \
              | grep -E '^[0-9]+\.' | tail -1 || echo "")
 
   if [[ -z "$panel_ip" ]]; then
-    # 备用：不指定 bind address
     panel_ip=$(dig +short "$PANEL_DOMAIN" @8.8.8.8 2>/dev/null \
                | grep -E '^[0-9]+\.' | tail -1 || echo "")
   fi
@@ -508,22 +553,17 @@ step_setup_wireguard() {
   success "面板 IP: ${panel_ip}"
   PANEL_IP="$panel_ip"
 
-  # 写入 /etc/hosts（固定面板 IP，防止 wg0 启动后走 wg0 解析）
   sed -i "/${PANEL_DOMAIN}/d" /etc/hosts
   echo "${PANEL_IP}  ${PANEL_DOMAIN}" >> /etc/hosts
   success "面板域名已固定到 /etc/hosts"
 
-  # 保存面板 IP 供 cron 比较
   mkdir -p "$(dirname "$PANEL_IP_FILE")"
   echo "$PANEL_IP" > "$PANEL_IP_FILE"
 
-  # ── 解析美国节点 IP 和端口 ────────────────────────────────────────────────
-  local us_pub_ip us_wg_port us_wg_tunnel_ip
-  us_pub_ip=$(    echo "$US_WG_ENDPOINT" | cut -d':' -f1)
-  us_wg_port=$(   echo "$US_WG_ENDPOINT" | cut -d':' -f2)
-  us_wg_tunnel_ip=$(echo "$US_WG_ADDR"  | cut -d'/' -f1)
+  local us_pub_ip us_wg_tunnel_ip
+  us_pub_ip=$(      echo "$US_WG_ENDPOINT" | cut -d':' -f1)
+  us_wg_tunnel_ip=$(echo "$US_WG_ADDR"    | cut -d'/' -f1)
 
-  # ── 生成 wg0.conf ─────────────────────────────────────────────────────────
   info "生成 ${WG_CONF}..."
   mkdir -p /etc/wireguard
 
@@ -531,51 +571,49 @@ step_setup_wireguard() {
 # ─────────────────────────────────────────────────────────────────────────────
 #  wg0.conf  —  香港中转节点 WireGuard 配置
 #  生成时间：$(date '+%Y-%m-%d %H:%M:%S')
-#  入口回包：source-based routing → eth0rt 表 → ${HK_WAN_IF}
-#  主动出站：默认路由 → wg0 → 美国出口
+#
+#  入口回包路径：源 IP = ${HK_PUB_IP}  →  eth0rt 表  →  ${HK_WAN_IF}
+#  主动出站路径：其他所有流量  →  主路由 default  →  wg0  →  美国
 # ─────────────────────────────────────────────────────────────────────────────
 
 [Interface]
 PrivateKey = ${HK_WG_PRIV}
 Address    = ${HK_WG_ADDR}
 Table      = off
-# Table = off：禁止 wg-quick 自动接管路由表，由 PostUp 精确控制
+# Table = off：禁止 wg-quick 自动接管主路由表，由 PostUp 手动精确控制
 
-# ── PostUp：建立路由规则（wg0 启动时执行）────────────────────────────────────
+# ── PostUp：wg0 启动时建立路由规则 ───────────────────────────────────────────
 
-# 1. 注册自定义路由表（幂等）
+# 1. 注册自定义路由表 eth0rt（幂等写入）
 PostUp = grep -q '^100 eth0rt$' /etc/iproute2/rt_tables || echo '100 eth0rt' >> /etc/iproute2/rt_tables
 
-# 2. eth0rt 表：以香港公网 IP 为源的回包 → 走公网网关 → 从 ${HK_WAN_IF} 对称返回
+# 2. eth0rt 表：默认出口指向公网网关
 PostUp = ip route replace default via ${HK_GW} dev ${HK_WAN_IF} table eth0rt
 
-# 3. 策略路由规则：源地址是香港公网 IP → 查 eth0rt 表（先删再加，保证幂等）
+# 3. policy rule：源地址是香港公网 IP → 查 eth0rt 表（先 del 保证幂等）
 PostUp = ip rule del pref 100 from ${HK_PUB_IP}/32 lookup eth0rt 2>/dev/null || true
 PostUp = ip rule add pref 100 from ${HK_PUB_IP}/32 lookup eth0rt
 
-# 4. 例外路由：美国节点公网 IP 必须走 eth0（WG 隧道外层封包，不能走 wg0）
+# 4. 例外路由：美国节点公网 IP 走 eth0（WG 隧道外层封包，不能走 wg0，否则自环）
 PostUp = ip route replace ${us_pub_ip}/32 via ${HK_GW} dev ${HK_WAN_IF}
 
-# 5. 例外路由：面板域名 IP 走 eth0（V2bX 拉配置必须直连面板）
+# 5. 例外路由：面板 IP 走 eth0（V2bX 拉配置必须直连面板）
 PostUp = ip route replace ${PANEL_IP}/32 via ${HK_GW} dev ${HK_WAN_IF}
 
-# 6. 隧道对端 IP 路由（WG 内网地址）
+# 6. 隧道对端路由（WG 内网地址）
 PostUp = ip route replace ${us_wg_tunnel_ip}/32 dev wg0
 
-# 7. 默认路由：所有主动出站（代理用户的目标访问）→ wg0 → 美国
+# 7. 默认路由：所有主动出站 → wg0 → 美国
 PostUp = ip route replace default dev wg0
 
-# ── PostDown：清理路由规则（wg0 关闭时执行）─────────────────────────────────
+# ── PostDown：wg0 关闭时清理路由规则 ─────────────────────────────────────────
 
-# 恢复默认路由（指向公网网关）
 PostDown = ip route replace default via ${HK_GW} dev ${HK_WAN_IF} onlink
-
-# 清理 PostUp 添加的规则（2>/dev/null || true 防止不存在时报错）
-PostDown = ip route del ${us_wg_tunnel_ip}/32 dev wg0                                  2>/dev/null || true
-PostDown = ip route del ${PANEL_IP}/32 via ${HK_GW} dev ${HK_WAN_IF}                  2>/dev/null || true
-PostDown = ip route del ${us_pub_ip}/32 via ${HK_GW} dev ${HK_WAN_IF}                 2>/dev/null || true
-PostDown = ip rule del pref 100 from ${HK_PUB_IP}/32 lookup eth0rt                    2>/dev/null || true
-PostDown = ip route flush table eth0rt                                                  2>/dev/null || true
+PostDown = ip route del ${us_wg_tunnel_ip}/32 dev wg0                       2>/dev/null || true
+PostDown = ip route del ${PANEL_IP}/32 via ${HK_GW} dev ${HK_WAN_IF}       2>/dev/null || true
+PostDown = ip route del ${us_pub_ip}/32 via ${HK_GW} dev ${HK_WAN_IF}      2>/dev/null || true
+PostDown = ip rule del pref 100 from ${HK_PUB_IP}/32 lookup eth0rt         2>/dev/null || true
+PostDown = ip route flush table eth0rt                                       2>/dev/null || true
 
 [Peer]
 PublicKey           = ${US_WG_PUBKEY}
@@ -587,12 +625,10 @@ EOF
   chmod 600 "$WG_CONF"
   success "${WG_CONF} 已生成"
 
-  # ── 启动 WireGuard ────────────────────────────────────────────────────────
   info "启动 wg-quick@wg0..."
   systemctl enable --quiet wg-quick@wg0
-  # 无论是 systemctl 还是手动 wg-quick up 启动的，都确保干净停止（触发 PostDown）
   systemctl stop wg-quick@wg0 2>/dev/null || true
-  wg-quick down wg0 2>/dev/null || true   # 兜底：接口还在则手动关
+  wg-quick down wg0            2>/dev/null || true
   sleep 1
   systemctl start wg-quick@wg0
   sleep 3
@@ -607,7 +643,7 @@ EOF
 }
 
 # =============================================================================
-#  公共步骤：WireGuard 三项验证
+#  公共步骤 4b/5：WireGuard 三项验证
 # =============================================================================
 
 step_verify_wireguard() {
@@ -615,11 +651,11 @@ step_verify_wireguard() {
 
   local all_pass=true
 
-  # ── ① 握手检测 ──────────────────────────────────────────────────────────
+  # ① 握手
   echo ""
   echo -e "  ${BOLD}① WireGuard 握手${NC}"
   local handshake_ts
-  handshake_ts=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+  handshake_ts=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | head -1 || echo "")
 
   if [[ -n "$handshake_ts" && "$handshake_ts" != "0" ]]; then
     local now ago
@@ -628,7 +664,7 @@ step_verify_wireguard() {
     if [[ $ago -lt 300 ]]; then
       success "握手正常（${ago} 秒前）"
     else
-      warn "握手存在，但距上次握手已 ${ago} 秒（>5 分钟，可能有延迟）"
+      warn "握手存在，但距上次握手已 ${ago} 秒（> 5 分钟，可能有延迟）"
     fi
   else
     fail_msg "无握手记录"
@@ -636,40 +672,40 @@ step_verify_wireguard() {
     warn "    1. 确认美国节点 wg-quick@wg0 正在运行"
     warn "    2. 确认美国节点防火墙开放 UDP ${US_WG_ENDPOINT##*:}"
     warn "    3. 检查美国节点是否已将香港公钥加为 Peer"
-    warn "    命令：ip route get ${US_WG_ENDPOINT%:*}   （期望走 ${HK_WAN_IF}）"
+    warn "    命令：ip route get ${US_WG_ENDPOINT%:*}  （期望走 ${HK_WAN_IF}）"
     all_pass=false
   fi
 
-  # ── ② 出口 IP 检测 ──────────────────────────────────────────────────────
+  # ② 出口 IP
   echo ""
   echo -e "  ${BOLD}② 出口 IP 地区（应为美国）${NC}"
   local out_ip out_country
   out_ip=$(curl -4 -s --max-time 12 https://ifconfig.io 2>/dev/null || echo "")
 
   if [[ -z "$out_ip" ]]; then
-    fail_msg "无法获取出口 IP（curl 超时或失败）"
+    fail_msg "无法获取出口 IP（curl 超时）"
     warn "  排查："
     warn "    1. wg show 确认握手"
     warn "    2. 美国节点是否开启 NAT MASQUERADE"
-    warn "    3. 美国节点 ip_forward 是否开启"
+    warn "    3. 美国节点 sysctl net.ipv4.ip_forward = 1 是否已设置"
     all_pass=false
   else
-    out_country=$(curl -s --max-time 6 "https://ipinfo.io/${out_ip}/country" 2>/dev/null | tr -d '[:space:]' || echo "未知")
+    out_country=$(curl -s --max-time 6 "https://ipinfo.io/${out_ip}/country" 2>/dev/null \
+                  | tr -d '[:space:]' || echo "未知")
     if [[ "$out_country" == "US" ]]; then
       success "出口 IP: ${out_ip}（美国 ✓）"
     else
       fail_msg "出口 IP: ${out_ip}，地区: ${out_country}（期望 US）"
       warn "  排查："
-      warn "    1. 检查 ip route show → default 是否走 wg0"
-      warn "    2. 检查美国节点 NAT 是否正常"
-      warn "    命令：ip route show | grep default"
+      warn "    ip route show | grep default  → 期望 default dev wg0"
+      warn "    美国节点：iptables -t nat -L POSTROUTING"
       all_pass=false
     fi
   fi
 
-  # ── ③ 入口回包路径检测 ──────────────────────────────────────────────────
+  # ③ 回包路径
   echo ""
-  echo -e "  ${BOLD}③ 入口回包路径（应走 ${HK_WAN_IF}）${NC}"
+  echo -e "  ${BOLD}③ 入口回包路径（源 IP=${HK_PUB_IP}，应走 ${HK_WAN_IF}）${NC}"
   local route_dev
   route_dev=$(ip route get 8.8.8.8 from "${HK_PUB_IP}" 2>/dev/null \
               | grep -oP 'dev \K\S+' | head -1 || echo "")
@@ -679,17 +715,15 @@ step_verify_wireguard() {
   else
     fail_msg "回包路径: ${HK_PUB_IP} → ${route_dev:-（无路由）}（期望 ${HK_WAN_IF}）"
     warn "  排查："
-    warn "    ip rule list    → 是否有 pref 100 from ${HK_PUB_IP}/32 lookup eth0rt"
-    warn "    ip route show table eth0rt  → 是否有 default via ${HK_GW} dev ${HK_WAN_IF}"
+    warn "    ip rule list               → 期望有 pref 100 from ${HK_PUB_IP}/32 lookup eth0rt"
+    warn "    ip route show table eth0rt → 期望有 default via ${HK_GW} dev ${HK_WAN_IF}"
     all_pass=false
   fi
 
-  # ── 结果判断 ────────────────────────────────────────────────────────────
   echo ""
   if [[ "$all_pass" == true ]]; then
     echo -e "  ${BOLD}${GREEN}三项验证全部通过，继续安装 V2bX${NC}"
     echo ""
-    return 0
   else
     echo -e "  ${BOLD}${RED}存在验证失败项，请根据上方提示修复后重新运行脚本${NC}"
     echo ""
@@ -704,7 +738,7 @@ step_verify_wireguard() {
 }
 
 # =============================================================================
-#  公共步骤：安装并配置 V2bX
+#  公共步骤 5a/5：安装并配置 V2bX
 # =============================================================================
 
 step_setup_v2bx() {
@@ -713,15 +747,11 @@ step_setup_v2bx() {
   echo ""
   read_input "请输入节点 ID（Node ID，从面板获取，纯数字）" NODE_ID
 
-  # 验证是数字
   while ! [[ "$NODE_ID" =~ ^[0-9]+$ ]]; do
     warn "Node ID 应为纯数字"
     read_input "请重新输入节点 ID" NODE_ID
   done
 
-  # ── 下载并运行 V2bX-script 安装脚本 ────────────────────────────────────────
-  # V2bX-script 提供交互式安装菜单，同时安装二进制、systemd service、v2bx 管理命令
-  # 我们让它完成安装，随后覆盖配置文件（安装脚本生成的 config 会被覆盖）
   local install_sh="/tmp/v2bx-install.sh"
   info "下载 V2bX-script 安装脚本..."
   if ! wget -qO "$install_sh" \
@@ -733,34 +763,26 @@ step_setup_v2bx() {
 
   echo ""
   echo -e "  ${BOLD}${YELLOW}[ 即将运行 V2bX 安装脚本 ]${NC}"
-  echo "  脚本会显示一个管理菜单，请选择「安装」选项（通常为数字 1）。"
-  echo "  安装过程中如询问配置，可随意填写——我们的脚本会立即覆盖这些配置。"
-  echo "  安装完成后脚本会自动继续。"
+  echo "  安装脚本会显示交互菜单，请选择「安装」选项（通常为数字 1）。"
+  echo "  安装过程中询问配置可随意填写——我们的脚本会立即覆盖。"
+  echo "  安装完成后控制权自动返回本脚本，v2bx 管理命令完整保留。"
   echo ""
   read -rp "  按 Enter 启动安装脚本..." _
 
-  # 运行安装脚本；它会自行 exit，控制权随后返回
   bash "$install_sh"
   rm -f "$install_sh"
 
-  # 确认二进制存在（install.sh 可能把二进制装到不同路径）
   if ! command -v V2bX &>/dev/null && [[ ! -f /usr/local/bin/V2bX ]]; then
     error "安装完成后未找到 V2bX 二进制，请检查安装脚本输出"
     exit 1
   fi
   success "V2bX 安装完成（v2bx 管理命令已可用）"
 
-  # ── 生成 config.yml ───────────────────────────────────────────────────────
   info "生成 V2bX 配置文件..."
   mkdir -p /etc/V2bX
 
   cat > "$V2BX_CONF" << EOF
-# ─────────────────────────────────────────────────────────────────────────────
-#  V2bX config.yml
-#  生成时间：$(date '+%Y-%m-%d %H:%M:%S')
-#  节点类型：vless + REALITY（配置由面板下发）
-# ─────────────────────────────────────────────────────────────────────────────
-
+# 生成时间：$(date '+%Y-%m-%d %H:%M:%S')
 Log:
   Level: warn
   AccessPath: /etc/V2bX/access.log
@@ -772,15 +794,13 @@ Nodes:
     NodeID:   ${NODE_ID}
     NodeType: vless
     Core:     sing
-
     Options:
       ListenIP:     0.0.0.0
       SendIP:       0.0.0.0
       TCPFastOpen:  true
-      SniffEnabled: false   # 关闭：当前架构不依赖 sniff 分流，减少行为变量
+      SniffEnabled: false
 EOF
 
-  # ── 生成 sing_origin.json ─────────────────────────────────────────────────
   cat > "$SING_CONF" << 'EOF'
 {
   "dns": {
@@ -794,26 +814,14 @@ EOF
     {
       "tag": "direct",
       "type": "direct",
-      "domain_resolver": {
-        "server": "remote",
-        "strategy": "ipv4_only"
-      }
+      "domain_resolver": { "server": "remote", "strategy": "ipv4_only" }
     },
-    {
-      "tag": "block",
-      "type": "block"
-    }
+    { "tag": "block", "type": "block" }
   ],
   "route": {
     "rules": [
-      {
-        "ip_is_private": true,
-        "outbound": "block"
-      },
-      {
-        "network": ["tcp", "udp"],
-        "outbound": "direct"
-      }
+      { "ip_is_private": true, "outbound": "block" },
+      { "network": ["tcp", "udp"], "outbound": "direct" }
     ]
   },
   "experimental": {
@@ -822,10 +830,12 @@ EOF
 }
 EOF
 
-  success "配置文件已生成"
-  success "  config.yml    → ${V2BX_CONF}"
-  success "  sing_origin.json → ${SING_CONF}"
+  success "配置文件已生成：${V2BX_CONF}  ${SING_CONF}"
 }
+
+# =============================================================================
+#  公共步骤 5b/5：启动 V2bX
+# =============================================================================
 
 step_start_v2bx() {
   header "步骤 5b/5：启动 V2bX"
@@ -839,7 +849,6 @@ step_start_v2bx() {
   else
     error "V2bX 启动失败，查看日志："
     journalctl -u V2bX --no-pager -n 30
-    echo ""
     warn "可能原因：节点 ID 不正确，或面板 API 不可达"
     warn "修复后执行：systemctl restart V2bX"
     exit 1
@@ -855,15 +864,9 @@ step_setup_panel_watcher() {
 
   info "生成监控脚本 ${UPDATE_PANEL_SCRIPT}..."
 
-  # 注意：EOF 不加引号，允许变量展开（将当前值写死到脚本中）
   cat > "$UPDATE_PANEL_SCRIPT" << SCRIPT
 #!/usr/bin/env bash
-# =============================================================================
-#  update-panel-route.sh
-#  功能：定时检查面板域名 IP 是否变更，变更则更新路由和 /etc/hosts
-#  部署方式：由 hk-setup.sh 自动安装，cron 每小时执行一次
-# =============================================================================
-
+# update-panel-route.sh — 由 hk-setup.sh 部署，cron 每小时执行
 set -euo pipefail
 
 PANEL_DOMAIN="${PANEL_DOMAIN}"
@@ -874,7 +877,6 @@ LOG="/var/log/update-panel-route.log"
 
 log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$*" >> "\$LOG"; }
 
-# 解析当前 IP
 NEW_IP=\$(dig +short "\$PANEL_DOMAIN" @8.8.8.8 2>/dev/null | grep -E '^[0-9]+\.' | tail -1 || echo "")
 
 if [[ -z "\$NEW_IP" ]]; then
@@ -884,21 +886,15 @@ fi
 
 OLD_IP=\$(cat "\$PANEL_IP_FILE" 2>/dev/null || echo "")
 
-# IP 未变，无需操作
-if [[ "\$NEW_IP" == "\$OLD_IP" ]]; then
-  exit 0
-fi
+[[ "\$NEW_IP" == "\$OLD_IP" ]] && exit 0
 
-log "检测到面板 IP 变更：[\$OLD_IP] → [\$NEW_IP]，开始更新..."
+log "面板 IP 变更：[\$OLD_IP] → [\$NEW_IP]"
 
-# 删除旧路由（旧 IP 不为空时）
 if [[ -n "\$OLD_IP" ]]; then
   ip route del "\${OLD_IP}/32" via "\$HK_GW" dev "\$HK_WAN_IF" 2>/dev/null && \
-    log "已删除旧路由：\$OLD_IP/32" || \
-    log "WARN: 删除旧路由失败（可能已不存在）"
+    log "已删除旧路由：\$OLD_IP/32" || log "WARN: 删除旧路由失败"
 fi
 
-# 添加新路由
 if ip route replace "\${NEW_IP}/32" via "\$HK_GW" dev "\$HK_WAN_IF"; then
   log "已添加新路由：\$NEW_IP/32 via \$HK_GW dev \$HK_WAN_IF"
 else
@@ -906,12 +902,9 @@ else
   exit 1
 fi
 
-# 更新 /etc/hosts
 sed -i "/\$PANEL_DOMAIN/d" /etc/hosts
 echo "\${NEW_IP}  \$PANEL_DOMAIN" >> /etc/hosts
 log "已更新 /etc/hosts：\$PANEL_DOMAIN → \$NEW_IP"
-
-# 更新记录文件
 echo "\$NEW_IP" > "\$PANEL_IP_FILE"
 log "更新完成"
 SCRIPT
@@ -919,29 +912,27 @@ SCRIPT
   chmod +x "$UPDATE_PANEL_SCRIPT"
   success "监控脚本已生成：${UPDATE_PANEL_SCRIPT}"
 
-  # ── 注册 cron（每小时第 5 分钟，避开整点拥堵）────────────────────────────
   local cron_line="5 * * * * ${UPDATE_PANEL_SCRIPT} >> /var/log/update-panel-route.log 2>&1"
-  # 先删除旧记录，再添加
-  ( crontab -l 2>/dev/null | grep -v "$UPDATE_PANEL_SCRIPT" || true
+  (
+    crontab -l 2>/dev/null | grep -v "$UPDATE_PANEL_SCRIPT" || true
     echo "$cron_line"
   ) | crontab -
-
   success "Cron 已注册（每小时第 5 分钟执行）"
-  success "日志路径：/var/log/update-panel-route.log"
 
-  # 立即执行一次，验证脚本可用（此时应输出「无变更」）
   info "立即执行一次验证..."
-  "$UPDATE_PANEL_SCRIPT" && success "监控脚本运行正常" || warn "监控脚本执行有警告（可查看日志）"
+  "$UPDATE_PANEL_SCRIPT" \
+    && success "监控脚本运行正常" \
+    || warn "监控脚本执行有警告，请查看：tail /var/log/update-panel-route.log"
 }
 
 # =============================================================================
-#  最终输出摘要
+#  最终部署摘要
 # =============================================================================
 
 print_summary() {
   echo ""
   echo -e "${BOLD}${GREEN}  ╔══════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${GREEN}  ║              部署成功！                             ║${NC}"
+  echo -e "${BOLD}${GREEN}  ║                   部署成功！                        ║${NC}"
   echo -e "${BOLD}${GREEN}  ╚══════════════════════════════════════════════════════╝${NC}"
   echo ""
   echo -e "${BOLD}  配置摘要${NC}"
@@ -963,8 +954,9 @@ print_summary() {
   echo ""
   echo -e "${BOLD}  日志路径${NC}"
   echo "  ─────────────────────────────────────────────────────"
-  echo "  V2bX 错误日志    : tail -f /etc/V2bX/error.log"
-  echo "  面板 IP 更新日志 : tail -f /var/log/update-panel-route.log"
+  echo "  V2bX 错误日志       : tail -f /etc/V2bX/error.log"
+  echo "  面板 IP 更新日志    : tail -f /var/log/update-panel-route.log"
+  echo "  lo 修复服务状态     : systemctl status lo-127-fix.service"
   echo ""
 }
 
