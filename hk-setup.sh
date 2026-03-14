@@ -229,6 +229,7 @@ step_base_system() {
   success "依赖包安装完成"
 
   info "禁用 IPv6（防 IPv6 泄露）..."
+  # 直接覆写，重复运行安全
   cat > /etc/sysctl.d/99-no-ipv6.conf << 'EOF'
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
@@ -245,29 +246,38 @@ EOF
   success "IPv4 转发已开启"
 
   info "配置 IPv4 优先（/etc/gai.conf）..."
+  # 幂等：已存在则不重复写
   grep -q 'ffff:0:0/96' /etc/gai.conf 2>/dev/null || \
     echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf
+  success "IPv4 优先已配置"
 
   info "禁用 systemd-resolved，锁定 resolv.conf（防 DNS 泄露）..."
+  # 先停服务，再解锁文件 —— 顺序不能反
   if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
     systemctl stop systemd-resolved
-    systemctl disable systemd-resolved --quiet
+    systemctl disable systemd-resolved --quiet 2>/dev/null || true
   fi
-  # 解除可能存在的 symlink
+  systemctl mask systemd-resolved --quiet 2>/dev/null || true  # 防止依赖关系把它拉起来
+
+  # 无论文件是普通文件、symlink、还是已被 chattr +i，都先解锁再删除
+  chattr -i /etc/resolv.conf 2>/dev/null || true
   rm -f /etc/resolv.conf
   cat > /etc/resolv.conf << 'EOF'
 nameserver 1.1.1.1
 nameserver 8.8.8.8
 options timeout:2 attempts:2 rotate
 EOF
-  # 解锁（防止已经 chattr +i）再加锁
-  chattr -i /etc/resolv.conf 2>/dev/null || true
   chattr +i /etc/resolv.conf
   success "resolv.conf 已锁定（chattr +i）"
 
   info "启用 nftables..."
-  systemctl enable --quiet nftables
-  systemctl start nftables
+  systemctl enable --quiet nftables 2>/dev/null || true
+  # 若已在运行则 restart，否则 start；两种情况都容错
+  if systemctl is-active --quiet nftables; then
+    systemctl restart nftables
+  else
+    systemctl start nftables
+  fi
   success "nftables 已启用"
 
   echo ""
@@ -483,7 +493,8 @@ PostUp = grep -q '^100 eth0rt$' /etc/iproute2/rt_tables || echo '100 eth0rt' >> 
 # 2. eth0rt 表：以香港公网 IP 为源的回包 → 走公网网关 → 从 ${HK_WAN_IF} 对称返回
 PostUp = ip route replace default via ${HK_GW} dev ${HK_WAN_IF} table eth0rt
 
-# 3. 策略路由规则：源地址是香港公网 IP → 查 eth0rt 表
+# 3. 策略路由规则：源地址是香港公网 IP → 查 eth0rt 表（先删再加，保证幂等）
+PostUp = ip rule del pref 100 from ${HK_PUB_IP}/32 lookup eth0rt 2>/dev/null || true
 PostUp = ip rule add pref 100 from ${HK_PUB_IP}/32 lookup eth0rt
 
 # 4. 例外路由：美国节点公网 IP 必须走 eth0（WG 隧道外层封包，不能走 wg0）
@@ -523,8 +534,9 @@ EOF
   # ── 启动 WireGuard ────────────────────────────────────────────────────────
   info "启动 wg-quick@wg0..."
   systemctl enable --quiet wg-quick@wg0
-  # 若已在运行则先停止
+  # 无论是 systemctl 还是手动 wg-quick up 启动的，都确保干净停止（触发 PostDown）
   systemctl stop wg-quick@wg0 2>/dev/null || true
+  wg-quick down wg0 2>/dev/null || true   # 兜底：接口还在则手动关
   sleep 1
   systemctl start wg-quick@wg0
   sleep 3
