@@ -53,8 +53,7 @@
 
 ```bash
 # 1. 下载脚本（在香港节点以 root 执行）
-wget -O hk-setup.sh https://your-host/hk-setup.sh
-chmod +x hk-setup.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/panwudi/network/main/hk-setup.sh)
 
 # 2. 运行
 sudo bash hk-setup.sh
