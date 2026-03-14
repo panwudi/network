@@ -343,19 +343,69 @@ step_collect_wg_fresh() {
 step_collect_wg_restore() {
   header "步骤 3/5：WireGuard 配置（从备份恢复）"
 
-  echo "  请依次输入备份时记录的值："
-  echo "  （格式参考：HK_PRIV_KEY=xxxxxxxx，只需输入 = 号后面的部分）"
+  echo -e "  ${BOLD}将备份内容整块粘贴到下方，粘贴完成后另起一行输入空行（直接回车）结束：${NC}"
+  echo ""
+  echo "  示例格式（# 注释行会被忽略）："
+  echo "    HK_PRIV_KEY=xxxxxxxx"
+  echo "    HK_WG_ADDR=10.0.0.3/32"
+  echo "    HK_WG_PEER_PUBKEY=xxxxxxxx"
+  echo "    HK_WG_ENDPOINT=5.6.7.8:51820"
+  echo "    HK_WG_KEEPALIVE=25"
+  echo ""
+  echo "  ────── 开始粘贴 ──────────────────────────────────────────"
+
+  # 读取直到遇到空行
+  local line key val
+  while IFS= read -r line; do
+    # 空行 → 结束输入
+    [[ -z "$line" ]] && break
+    # 忽略注释行和非 KEY=VALUE 行
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" != *=* ]] && continue
+
+    key="${line%%=*}"
+    val="${line#*=}"
+    # 去掉首尾空格
+    key="${key// /}"
+    val="${val#"${val%%[![:space:]]*}"}"
+
+    case "$key" in
+      HK_PRIV_KEY)        HK_WG_PRIV="$val"      ;;
+      HK_WG_ADDR)         HK_WG_ADDR="$val"       ;;
+      HK_WG_PEER_PUBKEY)  US_WG_PUBKEY="$val"     ;;
+      HK_WG_ENDPOINT)     US_WG_ENDPOINT="$val"   ;;
+      HK_WG_ALLOWED_IPS)  : ;;  # 我们固定用 0.0.0.0/0，忽略
+      HK_WG_KEEPALIVE)    WG_KEEPALIVE="$val"     ;;
+      # 网络信息字段：备份时顺带记录，恢复时不强制用（step_collect_network 会自动检测）
+      HK_WAN_IF)          [[ -z "$HK_WAN_IF" ]]  && HK_WAN_IF="$val"  ;;
+      HK_GW)              [[ -z "$HK_GW" ]]      && HK_GW="$val"      ;;
+      HK_PUB_IP)          [[ -z "$HK_PUB_IP" ]]  && HK_PUB_IP="$val"  ;;
+    esac
+  done
+
+  echo "  ────── 粘贴结束 ──────────────────────────────────────────"
   echo ""
 
-  read_input "HK_PRIV_KEY（香港 WG 私钥）" HK_WG_PRIV
-  read_input "HK_WG_ADDR（香港 WG 隧道地址，如 10.0.0.3/32）" HK_WG_ADDR
-  read_input "HK_WG_PEER_PUBKEY（美国节点 WG 公钥）" US_WG_PUBKEY
-  read_input "HK_WG_ENDPOINT（美国节点 Endpoint，格式 IP:端口）" US_WG_ENDPOINT
-  read_input "美国节点 WG 隧道内 IP（如 10.0.0.1/32）" US_WG_ADDR "10.0.0.1/32"
-  read_input "HK_WG_KEEPALIVE（PersistentKeepalive 秒数）" WG_KEEPALIVE "25"
+  # ── 检查必填字段 ─────────────────────────────────────────────────────────
+  local missing=false
+  [[ -z "$HK_WG_PRIV"     ]] && { warn "缺少 HK_PRIV_KEY";       missing=true; }
+  [[ -z "$HK_WG_ADDR"     ]] && { warn "缺少 HK_WG_ADDR";        missing=true; }
+  [[ -z "$US_WG_PUBKEY"   ]] && { warn "缺少 HK_WG_PEER_PUBKEY"; missing=true; }
+  [[ -z "$US_WG_ENDPOINT" ]] && { warn "缺少 HK_WG_ENDPOINT";    missing=true; }
 
-  echo ""
-  info "确认填写的值："
+  if [[ "$missing" == true ]]; then
+    warn "有必填字段未识别，请检查粘贴内容的格式（KEY=VALUE，每行一条）"
+    confirm "是否重新粘贴？" && step_collect_wg_restore || exit 1
+  fi
+
+  # 美国 WG 隧道 IP：没有在备份里记录，手动补问
+  if [[ -z "$US_WG_ADDR" ]]; then
+    read_input "美国节点 WG 隧道内 IP（如 10.0.0.1/32）" US_WG_ADDR "10.0.0.1/32"
+  fi
+  [[ -z "$WG_KEEPALIVE" ]] && WG_KEEPALIVE="25"
+
+  # ── 确认解析结果 ─────────────────────────────────────────────────────────
+  info "已解析的值："
   echo "    HK_WG_ADDR     = ${HK_WG_ADDR}"
   echo "    US_WG_PUBKEY   = ${US_WG_PUBKEY}"
   echo "    US_WG_ENDPOINT = ${US_WG_ENDPOINT}"
@@ -601,12 +651,36 @@ step_setup_v2bx() {
     read_input "请重新输入节点 ID" NODE_ID
   done
 
-  info "下载并安装 V2bX..."
-  if ! bash <(curl -Ls https://raw.githubusercontent.com/wyx2685/V2bX/master/install.sh); then
-    error "V2bX 安装失败，请检查网络或手动安装"
+  # ── 下载并运行 V2bX-script 安装脚本 ────────────────────────────────────────
+  # V2bX-script 提供交互式安装菜单，同时安装二进制、systemd service、v2bx 管理命令
+  # 我们让它完成安装，随后覆盖配置文件（安装脚本生成的 config 会被覆盖）
+  local install_sh="/tmp/v2bx-install.sh"
+  info "下载 V2bX-script 安装脚本..."
+  if ! wget -qO "$install_sh" \
+      https://raw.githubusercontent.com/wyx2685/V2bX-script/master/install.sh; then
+    error "下载失败，请检查网络"
     exit 1
   fi
-  success "V2bX 安装完成"
+  chmod +x "$install_sh"
+
+  echo ""
+  echo -e "  ${BOLD}${YELLOW}[ 即将运行 V2bX 安装脚本 ]${NC}"
+  echo "  脚本会显示一个管理菜单，请选择「安装」选项（通常为数字 1）。"
+  echo "  安装过程中如询问配置，可随意填写——我们的脚本会立即覆盖这些配置。"
+  echo "  安装完成后脚本会自动继续。"
+  echo ""
+  read -rp "  按 Enter 启动安装脚本..." _
+
+  # 运行安装脚本；它会自行 exit，控制权随后返回
+  bash "$install_sh"
+  rm -f "$install_sh"
+
+  # 确认二进制存在（install.sh 可能把二进制装到不同路径）
+  if ! command -v V2bX &>/dev/null && [[ ! -f /usr/local/bin/V2bX ]]; then
+    error "安装完成后未找到 V2bX 二进制，请检查安装脚本输出"
+    exit 1
+  fi
+  success "V2bX 安装完成（v2bx 管理命令已可用）"
 
   # ── 生成 config.yml ───────────────────────────────────────────────────────
   info "生成 V2bX 配置文件..."
