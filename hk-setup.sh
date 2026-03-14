@@ -291,23 +291,70 @@ EOF
 step_collect_network() {
   header "步骤 2/5：网络信息"
 
-  # 自动检测
-  local auto_wan_if auto_hk_gw auto_hk_pub_ip
-  auto_wan_if=$(   ip route show default | awk '/default/ {print $5}' | head -1 || echo "")
-  auto_hk_gw=$(    ip route show default | awk '/default/ {print $3}' | head -1 || echo "")
-  auto_hk_pub_ip=$(curl -4 -s --max-time 8 https://ifconfig.io 2>/dev/null      || echo "")
+  # ── 第一步：如果 wg0 还在跑，先把它停掉 ────────────────────────────────────
+  # wg0 运行时：默认路由指向 wg0，ip route / curl 全部走美国，采集到的都是错误值。
+  # 最干净的方案是先停掉 wg0，让网络回归正常，再做探测。
+  # 后续 step_setup_wireguard 会重新生成 conf 并重启，不会丢失配置。
+  if ip link show wg0 &>/dev/null 2>&1; then
+    warn "检测到 wg0 接口正在运行（上次安装残留），先将其关闭以确保采集到本机真实网络信息..."
+    systemctl stop wg-quick@wg0 2>/dev/null || true
+    wg-quick down wg0            2>/dev/null || true
+    sleep 1
 
+    # 如果停掉后默认路由消失（PostDown 有时不恢复），手动补回
+    if ! ip route show default | grep -q 'default'; then
+      # 从 eth0rt 表捞出之前记录的网关和网卡
+      local saved_gw saved_if
+      saved_if=$(ip route show table eth0rt 2>/dev/null | awk '/default/{print $5}' | head -1)
+      saved_gw=$(ip route show table eth0rt 2>/dev/null | awk '/default/{print $3}' | head -1)
+      if [[ -n "$saved_if" && -n "$saved_gw" ]]; then
+        ip route replace default via "$saved_gw" dev "$saved_if" onlink 2>/dev/null || true
+        warn "已从 eth0rt 表恢复默认路由：via ${saved_gw} dev ${saved_if}"
+      else
+        warn "无法自动恢复默认路由，请检查网络后手动执行："
+        warn "  ip route replace default via <网关> dev <网卡>"
+      fi
+    fi
+    success "wg0 已关闭，网络已回归本机直连"
+  fi
+
+  # ── 第二步：此时 wg0 已确认关闭，做正常探测 ────────────────────────────────
+  local auto_wan_if auto_hk_gw auto_hk_pub_ip
+
+  # 默认路由读取（此时一定走真实 WAN 网卡）
+  auto_wan_if=$(ip route show default | awk '/default/{print $5}' | head -1 || echo "")
+  auto_hk_gw=$( ip route show default | awk '/default/{print $3}' | head -1 || echo "")
+
+  # 公网 IP：如果能确定网卡，用 --interface 绑定出站，双重保险
+  if [[ -n "$auto_wan_if" ]]; then
+    auto_hk_pub_ip=$(curl --interface "$auto_wan_if" -4 -s --max-time 10 \
+                       https://ifconfig.io 2>/dev/null || echo "")
+  else
+    auto_hk_pub_ip=$(curl -4 -s --max-time 10 https://ifconfig.io 2>/dev/null || echo "")
+  fi
+
+  # ── 第三步：结果展示与确认 ───────────────────────────────────────────────────
   info "自动检测结果："
   echo "    公网网卡 : ${auto_wan_if:-未检测到}"
   echo "    默认网关 : ${auto_hk_gw:-未检测到}"
   echo "    公网 IP  : ${auto_hk_pub_ip:-未检测到}"
   echo ""
+
+  # 如果任一字段为空，说明网络环境异常，给出明确提示
+  if [[ -z "$auto_wan_if" || -z "$auto_hk_gw" || -z "$auto_hk_pub_ip" ]]; then
+    warn "部分字段未能自动检测，可能原因："
+    warn "  - 服务器没有默认路由（极少见）"
+    warn "  - 网络服务未就绪"
+    warn "请手动输入正确值，可参考：ip addr  /  ip route  /  云控制台"
+  fi
+
+  echo ""
   info "请确认或修改（直接回车接受自动检测值）："
   echo ""
 
   read_input "公网网卡名（如 eth0 / ens3 / ens5）" HK_WAN_IF "$auto_wan_if"
-  read_input "默认网关 IP" HK_GW "$auto_hk_gw"
-  read_input "本机公网 IP（香港节点）" HK_PUB_IP "$auto_hk_pub_ip"
+  read_input "默认网关 IP"                          HK_GW     "$auto_hk_gw"
+  read_input "本机公网 IP（香港节点）"               HK_PUB_IP "$auto_hk_pub_ip"
 
   echo ""
   info "确认填写的值："
@@ -315,7 +362,7 @@ step_collect_network() {
   echo "    HK_GW     = ${HK_GW}"
   echo "    HK_PUB_IP = ${HK_PUB_IP}"
   echo ""
-  confirm "以上信息是否正确？" || step_collect_network
+  confirm "以上信息是否正确？" || { step_collect_network; return; }
 }
 
 # =============================================================================
@@ -432,14 +479,23 @@ step_collect_wg_restore() {
 step_setup_wireguard() {
   header "步骤 4a/5：生成 WireGuard 配置"
 
-  # ── 解析面板 IP（wg0 未启动时走 eth0，确保能解析）──────────────────────────
-  info "解析面板域名 ${PANEL_DOMAIN}（wg0 启动前）..."
+  # ── 防御：确保 wg0 已关闭，panel 域名解析和后续路由探测都走 eth0 ────────────
+  if ip link show wg0 &>/dev/null 2>&1; then
+    warn "wg0 仍在运行，关闭后再继续..."
+    systemctl stop wg-quick@wg0 2>/dev/null || true
+    wg-quick down wg0            2>/dev/null || true
+    sleep 1
+  fi
+
+  # ── 解析面板 IP（wg0 已关闭，此查询走 HK_WAN_IF 直出）──────────────────────
+  info "解析面板域名 ${PANEL_DOMAIN}..."
   local panel_ip
-  panel_ip=$(dig +short "$PANEL_DOMAIN" @1.1.1.1 2>/dev/null \
+  # 绑定 HK_WAN_IF 出站做查询，彻底排除残留路由的干扰
+  panel_ip=$(dig +short "$PANEL_DOMAIN" @1.1.1.1 -b "${HK_PUB_IP}" 2>/dev/null \
              | grep -E '^[0-9]+\.' | tail -1 || echo "")
 
   if [[ -z "$panel_ip" ]]; then
-    # 备用：使用 8.8.8.8
+    # 备用：不指定 bind address
     panel_ip=$(dig +short "$PANEL_DOMAIN" @8.8.8.8 2>/dev/null \
                | grep -E '^[0-9]+\.' | tail -1 || echo "")
   fi
